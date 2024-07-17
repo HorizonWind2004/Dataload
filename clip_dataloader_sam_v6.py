@@ -201,7 +201,7 @@ class FeaDatasetListZip(VisionDataset):
             'vae_feature': image,
             'prompt': description,
             'segment_label': segment_label,
-            'jpg_name': jpg_name
+            'jpg_name': jpg_name # only for debug
         }
         if self.load_RGB:
             return_dict['RGB_image'] = RGB_img
@@ -262,8 +262,9 @@ class FeaDatasetListZip(VisionDataset):
                  phase_random_order_v4=False, cat_small_size=False, phase_random_order_v3_p=1.0,
                  use_limit_instance_num=False, limit_instance_num=1000, replace_desc_with_phase=False,
                  aug_phase_with_and=False, replace_desc_with_phase_p=1.0, inter_mode='nearest',
-                 load_RGB=False, RGB_path='', instance_score_threshold=0.0):
-        super(FeaDatasetListZip, self).__init__(list_data_root, transform=transform, target_transform=target_transform)
+                 load_RGB=False, RGB_path='', instance_score_threshold=0.0, train_with_mask=False, replace_box_with_mask_p=0.0,
+                 drop_phase_in_img=False, drop_phase_in_img_p=0.5, replace_desc_with_null=False, replace_desc_with_null_p=0.0):
+        super(FeaDatasetListZip, self).__init__(list_data_root, transform=transform, target_transform=target_transform, uniform_aug_phase_with_and=False)
         # self.caption_shuffle_percent = caption_shuffle_percent 这个参数目前没有任何用
         # this_card_all_idx: local shuffle mode or others
         print(f'[Dataset Initialization Info] RANK{os.environ["RANK"]}')
@@ -304,6 +305,13 @@ class FeaDatasetListZip(VisionDataset):
         self.RGB_path = RGB_path
         self.RGB_lmdb = None
         self.instance_score_threshold = instance_score_threshold
+        self.train_with_mask = train_with_mask
+        self.replace_box_with_mask_p = replace_box_with_mask_p
+        self.uniform_aug_phase_with_and = uniform_aug_phase_with_and
+        self.drop_phase_in_img = drop_phase_in_img
+        self.drop_phase_in_img_p = drop_phase_in_img_p
+        self.replace_desc_with_null = replace_desc_with_null
+        self.replace_desc_with_null_p = replace_desc_with_null_p
         self.filter_list = ["top", "side", "a view", "various types", "front", "half", "the side", "lots", "a picture",
                             "a close up", "a close up", "a pair", "a group", "to her", "A group", "A couple", "A view"]
         if self.use_blip_caption:
@@ -405,9 +413,21 @@ class FeaDatasetListZip(VisionDataset):
                 semantic_mask_list = []  # bounding box 对应的 01 mask
                 if self.load_RGB:
                     instance_img_list = []  # 每个instance 对应的图 (224, 224, 3)
+                    instance_img_mask_list = []
+                    instance_img_box_list = []
                 box_list = []
+                phase_book = set()
+                if self.drop_phase_in_img and np.random.uniform() < self.drop_phase_in_img_p:
+                    all_phase = set()
+                    for key in seg_label.keys():
+                        segment_data = seg_label[key]
+                        current_phase = ' '.join(segment_data['labels'][0].split())
+                        all_phase.add(current_phase)
+                    for current_phase in all_phase:
+                        if np.random.uniform() < self.drop_phase_in_img_p:
+                            phase_book.add(current_phase)
+                            
                 if self.one_phase_one_instance:
-                    phase_book = set()
                     for key in seg_label.keys():
                         
                         segment_data = seg_label[key]
@@ -427,6 +447,8 @@ class FeaDatasetListZip(VisionDataset):
                             segment_bboxes = segment_data['bbox']
                             if self.load_RGB:
                                 instance_shapes = segment_data['segmentation']
+                            if self.train_with_mask:
+                                instance_shapes = segment_data['segmentation']
                             if self.only_use_one_box and len(segment_bboxes) > 1:
                                 assert False, "Currently, you set only_use_one_box=True, so we pass this sample"
                             for i, segment_bbox in enumerate(segment_bboxes):
@@ -443,6 +465,12 @@ class FeaDatasetListZip(VisionDataset):
                                 H2 = max(0, min(512, H2))
                                 assert W1 <= W2 and H1 <= H2
                                 semantic_mask[:, int(H1): int(H2), int(W1): int(W2)] = 1
+                                
+                                if self.train_with_mask and np.random.uniform() <= self.replace_box_with_mask_p:
+                                    semantic_mask = instance_shapes[i]
+                                    semantic_mask = mask_utils.decode(semantic_mask)[None, ...]
+                                    
+                                instance_img_mask = np.zeros((1, 512, 512))
                                 if self.load_RGB:
                                     instance_shape = instance_shapes[i]
                                     instance_shape = mask_utils.decode(instance_shape)[None, ...]
@@ -452,9 +480,14 @@ class FeaDatasetListZip(VisionDataset):
                                     instance_img = torch.from_numpy(instance_img)[None, ...]
                                     instance_img = F.interpolate(instance_img, (512, 512))
                                     instance_img = instance_img[0, ...].numpy()
+                                    instance_img_mask[:, int(H1): int(H2), int(W1): int(W2)] = 1
+                                    if self.train_with_mask and np.random.uniform <= 0.5:
+                                        instance_img_mask = instance_shape
                                 if semantic_mask.sum() / (512 * 512) >= self.mask_area_threshold:
                                     if self.load_RGB:
                                         instance_img_list.append(instance_img)
+                                        instance_img_mask_list.append(instance_img_mask)
+                                        instance_img_box_list.append(np.array([[W1, W2, H1, H2]]))
                                     phase_list.append(current_phase)
                                     semantic_mask_list.append(semantic_mask)
                                     box_list.append(np.array([[W1, W2, H1, H2]]))
@@ -463,6 +496,7 @@ class FeaDatasetListZip(VisionDataset):
                 # if len(phase_list) == 0:
                 #     assert  False
                 else:
+                    assert False
                     for key in seg_label.keys():
                         segment_data = seg_label[key]
                         current_phase = ' '.join(segment_data['labels'][0].split()[:-1])
@@ -511,6 +545,8 @@ class FeaDatasetListZip(VisionDataset):
                 if self.load_RGB:
                     ret_result['RGB_image'] = RGB_img
                     ret_result['instance_img_list'] = instance_img_list
+                    ret_result['instance_img_mask_list'] = instance_img_mask_list
+                    ret_result['instance_img_box_list'] = instance_img_box_list
                 return ret_result
             except Exception as e:
                 # solve missing image case.
@@ -548,6 +584,9 @@ class FeaDatasetListZip(VisionDataset):
         if self.load_RGB:
             RGB_img = data['RGB_image']
             instance_img_list = data['instance_img_list']
+            instance_img_mask_list = data['instance_img_mask_list']
+            instance_img_box_list = data['instance_img_box_list']
+            assert len(instance_img_list) == len(instance_img_mask_list)
             assert len(phase_list) == len(instance_img_list)
         assert len(phase_list) == len(semantic_mask_list)
         assert len(phase_list) == len(box_list)
@@ -566,30 +605,36 @@ class FeaDatasetListZip(VisionDataset):
             semantic_mask_list = [semantic_mask_list[o] for o in random_idx]
             if self.load_RGB:
                 instance_img_list = [instance_img_list[o] for o in random_idx]
+                instance_img_mask_list = [instance_img_mask_list[o] for o in random_idx]
+                instance_img_box_list = [instance_img_box_list[o] for o in random_idx]
+                
             box_list = [box_list[o] for o in random_idx]
 
         if self.aug_phase_with_and:
             true_phase_num = len(phase_list)
-            phase_list = [self.aug_phase_with_and_function(o, true_phase_num) for o in phase_list]
+            if self.uniform_aug_phase_with_and:
+                phase_list = [self.aug_phase_with_and_function(o, random.randint(1, 6)) for o in phase_list]
+            else:
+                phase_list = [self.aug_phase_with_and_function(o, true_phase_num) for o in phase_list]
 
         if self.drop_desc:
             phase_list = phase_list
             semantic_mask_list = semantic_mask_list
-            if self.load_RGB:
-                instance_img_list = instance_img_list
+            # if self.load_RGB:
+            #     instance_img_list = instance_img_list
             box_list = box_list
         else:
             if self.replace_desc_with_phase and len(phase_list) > 0 and np.random.uniform() < self.replace_desc_with_phase_p:
                 desc = phase_list[random.randint(0, min(len(phase_list), self.phase_num - 1) - 1)]
             phase_list = [desc] + phase_list
             if self.desc_use_sup_mask:
-                if self.load_RGB:
-                    instance_img_list = [RGB_img] + instance_img_list
+                # if self.load_RGB:
+                #     instance_img_list = [RGB_img] + instance_img_list
                 semantic_mask_list = [self.get_sup_mask(semantic_mask_list)] + semantic_mask_list
                 box_list = [np.array([[0, 512, 0, 512]])] + box_list
             else:
-                if self.load_RGB:
-                    instance_img_list = [RGB_img] + instance_img_list
+                # if self.load_RGB:
+                #     instance_img_list = [RGB_img] + instance_img_list
                 semantic_mask_list = [np.ones((1, 512, 512))] + semantic_mask_list
                 box_list = [np.array([[0, 512, 0, 512]])] + box_list
 
@@ -601,12 +646,14 @@ class FeaDatasetListZip(VisionDataset):
             phase_list += ["" for i in range(add_num)]
             if self.null_use_one_box:
                 if self.load_RGB:
-                    instance_img_list += [np.zeros((3, 512, 512)) for i in range(add_num)]
+                    instance_img_list += [np.ones((3, 512, 512)) for i in range(add_num)]
+                    instance_img_mask_list += [np.zeros((3, 512, 512)) for i in range(add_num)]
                 semantic_mask_list += [np.ones((1, 512, 512)) for i in range(add_num)]
                 box_list += [np.array([[0, 512, 0, 512]]) for i in range(add_num)]
             else:
                 if self.load_RGB:
-                    instance_img_list += [np.zeros((3, 512, 512)) for i in range(add_num)]
+                    instance_img_list += [np.ones((3, 512, 512)) for i in range(add_num)]
+                    instance_img_mask_list += [np.zeros((3, 512, 512)) for i in range(add_num)]
                 semantic_mask_list += [np.zeros((1, 512, 512)) for i in range(add_num)]
                 box_list += [np.array([[0, 0, 0, 0]]) for i in range(add_num)]
         else:
@@ -614,6 +661,7 @@ class FeaDatasetListZip(VisionDataset):
             semantic_mask_list = semantic_mask_list[: self.phase_num]
             if self.load_RGB:
                 instance_img_list = instance_img_list[: self.phase_num]
+                instance_img_mask_list = instance_img_mask_list[: self.phase_num]
             box_list = box_list[: self.phase_num]
         if self.phase_random_order:
             random_idx = list(range(self.phase_num))
@@ -622,6 +670,7 @@ class FeaDatasetListZip(VisionDataset):
             semantic_mask_list = [semantic_mask_list[o] for o in random_idx]
             if self.load_RGB:
                 instance_img_list = [instance_img_list[o] for o in random_idx]
+                instance_img_mask_list = [instance_img_mask_list[o] for o in random_idx]
             box_list = [box_list[o] for o in random_idx]
         if self.phase_random_order_v2:
             # phase_random_v2主要是想打乱短语和空文本的顺序, 全局文本不变的。
@@ -634,6 +683,7 @@ class FeaDatasetListZip(VisionDataset):
             semantic_mask_list = [semantic_mask_list[o] for o in random_idx]
             if self.load_RGB:
                 instance_img_list = [instance_img_list[o] for o in random_idx]
+                instance_img_mask_list = [instance_img_mask_list[o] for o in random_idx]
             box_list = [box_list[o] for o in random_idx]
         if self.phase_random_order_v3:
             assert not self.phase_random_order
@@ -647,6 +697,7 @@ class FeaDatasetListZip(VisionDataset):
                 semantic_mask_list = [semantic_mask_list[o] for o in random_idx]
                 if self.load_RGB:
                     instance_img_list = [instance_img_list[o] for o in random_idx]
+                    instance_img_mask_list = [instance_img_mask_list[o] for o in random_idx]
                 box_list = [box_list[o] for o in random_idx]
         if self.phase_random_order_v4:
             assert not self.phase_random_order
@@ -660,14 +711,15 @@ class FeaDatasetListZip(VisionDataset):
             semantic_mask_list = [semantic_mask_list[o] for o in random_idx]
             if self.load_RGB:
                 instance_img_list = [instance_img_list[o] for o in random_idx]
+                instance_img_mask_list = [instance_img_mask_list[o] for o in random_idx]
             box_list = [box_list[o] for o in random_idx]
 
 
         if self.append_uncond:
             phase_list.append("")
             semantic_mask_list.append(sup_mask)
-            if self.load_RGB:
-                instance_img_list.append(np.zeros(3, 512, 512))
+            # if self.load_RGB:
+            #     instance_img_list.append(np.zeros(3, 512, 512))
             box_list.append(np.array([[0, 512, 0, 512]]))
 
 
@@ -737,6 +789,9 @@ class FeaDatasetListZip(VisionDataset):
                 instance_img_list = [o.transpose(2, 0, 1) for o in instance_img_list]
                 instance_img_list = [torch.from_numpy(o).float()[None, ...] for o in instance_img_list]
                 instance_img = torch.cat(instance_img_list, dim=0)
+                instance_img_mask_list = [torch.from_numpy(o).float() for o in instance_img_mask_list]
+                instance_img_mask_list = [F.interpolate(o[None, ...], (64, 64), mode=self.inter_mode)[0, ...] for o in instance_img_mask_list]
+                instance_img_mask = torch.cat(instance_img_mask_list, dim=0)
             # instance_img = F.interpolate(instance_img, (224, 224), mode=self.inter_mode)
 
             supplement_mask = torch.from_numpy(sup_mask).float()
@@ -762,6 +817,7 @@ class FeaDatasetListZip(VisionDataset):
             if self.load_RGB:
                 ret['RGB_image'] = RGB_img
                 ret['instance_img'] = instance_img
+                ret['instance_img_mask'] = instance_img_mask
             return ret
         else:
             return arr, model_kwargs
@@ -850,7 +906,14 @@ def CLIP_fea_zip_dataloader(cfg, tokenizer):
                                 inter_mode=cfg.inter_mode,
                                 load_RGB=cfg.load_RGB,
                                 RGB_path=cfg.RGB_path,
-                                instance_score_threshold=cfg.instance_score_threshold
+                                instance_score_threshold=cfg.instance_score_threshold,
+                                train_with_mask=cfg.train_with_mask,
+                                replace_box_with_mask_p=cfg.replace_box_with_mask_p,
+                                uniform_aug_phase_with_and=cfg.uniform_aug_phase_with_and,
+                                drop_phase_in_img=cfg.drop_phase_in_img,
+                                drop_phase_in_img_p=cfg.drop_phase_in_img_p,
+                                replace_desc_with_null=cfg.replace_desc_with_null,
+                                replace_desc_with_null_p=cfg.replace_desc_with_null_p,
                                 )
 
     tensor = torch.zeros(cfg.world_size).cuda()
