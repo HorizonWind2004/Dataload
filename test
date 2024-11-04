@@ -1,0 +1,480 @@
+/**
+ * @file client.cpp
+ * @brief This file contains the implementation of a client application for a computer networks lab.
+ * 
+ * The client application allows users to connect to a server using either TCP or UDP protocols,
+ * send various requests to the server, and receive responses. The application supports functionalities
+ * such as connecting to a server, disconnecting, getting city names, getting weather information,
+ * listing connected clients, and sending messages.
+ * 
+ * The main components of the application include:
+ * - A menu-driven interface for user interaction.
+ * - Functions for handling connections and communication with the server.
+ * - A receive thread for handling incoming messages from the server.
+ * - Utility functions for sending requests and releasing resources.
+ * 
+ * The application uses the Winsock2 library for network communication.
+ * 
+ * @note This application is designed to run on Windows operating systems.
+ * 
+ * @dependencies
+ * - networking.h: Header file containing necessary networking-related declarations.
+ * - Winsock2 library: For network communication.
+ * 
+ * @usage
+ * 1. Compile the application using a C++ compiler.
+ * 2. Run the executable.
+ * 3. Follow the on-screen menu to interact with the server.
+ * 
+ * @section Menu Options
+ * - c: Connect to server
+ * - d: Disconnect
+ * - n: Get city name
+ * - w: Get weather info
+ * - l: Connection list
+ * - f: Send message
+ * - q: Quit
+ * 
+ * @section Protocols
+ * - TCP: Reliable, connection-oriented protocol.
+ * - UDP: Unreliable, connectionless protocol.
+ * 
+ * @section Error Handling
+ * The application includes basic error handling for invalid inputs and connection failures.
+ * 
+ * @section Multithreading
+ * The application uses multithreading to handle incoming messages from the server concurrently.
+ * 
+ * @section Macros
+ * - CHECK_CONNECTED: Macro to check if any server is connected.
+ * - CHECK_ID_EXIST: Macro to check if a given server ID exists.
+ * 
+ * @section Cleanup
+ * The application ensures proper cleanup of resources such as sockets and threads before exiting.
+ */
+
+#include "networking.h"
+#include <iostream>
+#include <map>
+#include <string>
+#include <thread>
+#include <vector>
+#include <winsock2.h>
+using std::string;
+using std::map;
+using std::thread;
+using std::vector;
+
+void printMenu() {
+    printf("----------------------Welcome----------------------\n");
+    printf("---              Please choose:                 ---\n");
+    printf("---                   c Connect to server       ---\n");
+    printf("---                   d Disconnect              ---\n");
+    printf("---                   n Get city name           ---\n");
+    printf("---                   w Get weather info        ---\n");
+    printf("---                   l Connection list         ---\n");
+    printf("---                   f Send message            ---\n");
+    printf("---                   q Quit                    ---\n");
+    printf("---------------------------------------------------\n");
+}
+
+map<int, thread> threads;
+map<string, int> serverID;
+map<int, string> IDMap;
+map<int, SOCKET> clientSocket;
+map<int, sockaddr_in> serverAddr;
+map<int, int> protocolType;
+
+/**
+ * @brief Check if the package is valid and the response is valid
+ */
+bool checkConnected() {
+    if (serverID.empty()) {
+        printf("No server connected\n");
+        return false;
+    }
+    return true;
+}
+
+
+void receiveThread(int isTCP, SOCKET nowClientSocket, int id,
+                                     sockaddr_in serverAddr) {
+    while (true) {
+        char buffer[1024];
+        int len;
+        if (isTCP) {
+            len = recv(nowClientSocket, buffer, 1024, 0); // TCP
+        } else {
+            int size = sizeof(serverAddr);
+            len = recvfrom(nowClientSocket, buffer, 1024, 0, (sockaddr *)&serverAddr, &size);
+        }
+        if (len <= 0) {
+            printf("[thread] Disconnected from server %d, thread closed\n", id);
+            break;
+        }
+        RawData data(buffer, buffer + len);
+        std::unique_ptr<Package> package = Package::deserialize(data);
+        if (package == nullptr) {
+            printf("Received invalid data\n");
+            continue;
+        }
+        switch (package->getType()) {
+        case RESPONSE: {
+            ResponsePackage *responsePackage =
+                    dynamic_cast<ResponsePackage *>(package.get());
+            std::unique_ptr<Response> response = std::move(responsePackage->response);
+            switch (response->getType()) {
+            case CITY_NAME: {
+                ResponseCityName *cityName =
+                        dynamic_cast<ResponseCityName *>(response.get());
+                printf("City name: %s\n", cityName->cityName.c_str());
+                break;
+            }
+            case WEATHER_INFO: {
+                ResponseWeatherInfo *weatherInfo =
+                        dynamic_cast<ResponseWeatherInfo *>(response.get());
+                printf("Weather info:\n");
+                printf("Temperature: %f\n", weatherInfo->celcius);
+                printf("Status: %s\n",  std::to_string(weatherInfo->rainShine).c_str());
+                printf("Wind direction: %s\n",  std::to_string(weatherInfo->windDirection).c_str());
+                printf("Wind Speed: %u\n", weatherInfo->windSpeed);
+                printf("Humidity: %u\n", weatherInfo->humidity);
+                break;
+            }
+            case SEND_MESSAGE: {
+                ResponseSendMessage *sendMessage =
+                        dynamic_cast<ResponseSendMessage *>(response.get());
+                printf("Message send %s\n", sendMessage->id ? "successful" : "failed");
+                break;
+            }
+            case CLIENT_LIST: {
+                ResponseClientList *clientList =
+                        dynamic_cast<ResponseClientList *>(response.get());
+                printf("Client list:\n");
+                for (const ClientInfo &client : clientList->clients) {
+                    printf("ID: %d, IP: %d.%d.%d.%d, Port: %d\n", client.id,
+                             client.ip >> 24, (client.ip >> 16) & 0xFF,
+                             (client.ip >> 8) & 0xFF, client.ip & 0xFF, client.port);
+                }
+                break;
+            }
+            default:
+                break;
+            }
+            break;
+        }
+        case DIRECTIVE: {
+            DirectivePackage *directivePackage =
+                    dynamic_cast<DirectivePackage *>(package.get());
+            std::unique_ptr<Directive> directive = std::move(directivePackage->directive);
+            switch (directive->getType()) {
+            case CLIENT_ONLINE: {
+                DirectiveClientOnline *clientOnline =
+                        dynamic_cast<DirectiveClientOnline *>(directive.get());
+                ClientInfo client = clientOnline->client;
+                printf("Client %d online, IP: %d.%d.%d.%d, Port: %d\n", client.id,
+                         client.ip >> 24, (client.ip >> 16) & 0xFF,
+                         (client.ip >> 8) & 0xFF, client.ip & 0xFF, client.port);
+                break;
+            }
+            case CLIENT_OFFLINE: {
+                DirectiveClientOffline *clientOffline =
+                        dynamic_cast<DirectiveClientOffline *>(directive.get());
+                printf("Client %d offline\n", clientOffline->id);
+                break;
+            }
+            case WEATHER_WARNING: {
+                DirectiveWeatherWarning *weatherWarning =
+                        dynamic_cast<DirectiveWeatherWarning *>(directive.get());
+                printf("Weather warning info:\n");
+                printf("Type: %s\n", std::to_string(weatherWarning->warningType).c_str());
+                printf("Latitude: %f\n", weatherWarning->latitude);
+                printf("Longitude: %f\n", weatherWarning->longitude);
+                printf("Level: %d\n", weatherWarning->level);
+                printf("Time: %d-%d %d:%d:%d\n", weatherWarning->month,
+                             weatherWarning->day, weatherWarning->hour,
+                             weatherWarning->minute, weatherWarning->second);
+                printf("Place: %s\n", weatherWarning->place.c_str());
+                break;
+            }
+            case MESSAGE: {
+                DirectiveMessage *message =
+                        dynamic_cast<DirectiveMessage *>(directive.get());
+                printf("Message from %d: %s\n", message->source, message->message.c_str());
+                break;
+            }
+            default:
+                break;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
+
+/**
+ * @brief Send a request to the server
+ * @tparam T The type of request
+ * @param id The server ID
+ * @param request The request object
+ */
+template <typename T> void sendRequest(int id, T request) {
+    RawData data = request.serialize();
+    if (protocolType[id] == 1) {
+        send(clientSocket[id], (char *)data.data(), data.size(), 0);
+    } else {
+        sendto(clientSocket[id], (char *)data.data(), data.size(), 0,
+                     (sockaddr *)&serverAddr[id], sizeof(serverAddr[id]));
+    }
+}
+
+bool checkDate(int year, int month, int day) {
+    if (year < 0 || month < 1 || month > 12 || day < 1 || day > 31) {
+        return false;
+    }
+    if (month == 2) {
+        if (year % 4 == 0 && year % 100 != 0 || year % 400 == 0) {
+            return day <= 29;
+        } else {
+            return day <= 28;
+        }
+    }
+    if (month == 4 || month == 6 || month == 9 || month == 11) {
+        return day <= 30;
+    }
+    return true;
+}
+
+/**
+ * @brief Release resources for a given server ID
+ * @param id The server ID
+ */
+void releaseResources(int id) {
+    serverID.erase(IDMap[id]);
+    IDMap.erase(id);
+    protocolType.erase(id);
+    clientSocket.erase(id);
+    serverAddr.erase(id);
+    threads.erase(id);
+    printf("Disconnected successfully\n");
+}
+
+#define CHECK_CONNECTED()                                                      \
+    if (serverID.empty()) {                                                      \
+        printf("No server connected\n");                                           \
+        break;                                                                     \
+    }
+
+#define CHECK_ID_EXIST(id)                                                     \
+    if (IDMap.find(id) == IDMap.end()) {                                         \
+        printf("ID does not exist\n");                                             \
+        break;                                                                     \
+    }
+
+/**
+ * @brief Entry point of the client application.
+ * 
+ * This function initializes the Winsock library and enters an infinite loop to handle user input.
+ * It provides a menu for the user to connect to a server, disconnect from a server, request city name,
+ * request weather information, request client list, send a message, or quit the application.
+ * 
+ * The user can choose between TCP and UDP protocols for connecting to the server.
+ * 
+ * @return int Returns 0 upon successful termination of the application.
+ */
+int main() {
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    int serverNum = 0;
+    while (true) {
+        printMenu();
+        char choice, buffer[1024];
+        int len, id, protocol, port;
+        string ip;
+        std::cin >> choice;
+        switch (choice) {
+        case 'c': {
+            // Prompt user to choose protocol (TCP or UDP)
+            printf("Choose protocol: 1. TCP 2. UDP\n");
+            std::cin >> protocol;
+            if (protocol != 1 && protocol != 2) {
+                printf("Invalid input, please try again\n");
+                break;
+            }
+            // Get server IP address and port from user
+            printf("Enter server IP address: ");
+            std::cin >> ip;
+            printf("Enter server port: ");
+            std::cin >> port;
+            sockaddr_in nowServerAddr;
+            nowServerAddr.sin_family = AF_INET;
+            nowServerAddr.sin_addr.S_un.S_addr = inet_addr(ip.c_str());
+            nowServerAddr.sin_port = htons(port);
+
+            // Create socket based on chosen protocol
+            SOCKET nowClientSocket =
+                    socket(AF_INET, protocol == 1 ? SOCK_STREAM : SOCK_DGRAM, 0);
+            if (protocol == 1) {
+                // Connect to server using TCP
+                if (connect(nowClientSocket, (sockaddr *)&nowServerAddr,
+                                        sizeof(nowServerAddr)) == SOCKET_ERROR) {
+                    printf("Connection failed\n");
+                    break;
+                }
+            } else { // Use special UDP connection request
+                sockaddr_in clientAddr;
+                clientAddr.sin_family = AF_INET;
+                clientAddr.sin_addr.S_un.S_addr = htonl(INADDR_ANY);
+                clientAddr.sin_port = htons(0);
+                bind(nowClientSocket, (sockaddr *)&clientAddr, sizeof(clientAddr));
+                RequestUdpConnect request(serverNum);
+                RawData data = request.serialize();
+                sendto(nowClientSocket, (char *)data.data(), data.size(), 0,
+                             (sockaddr *)&nowServerAddr, sizeof(nowServerAddr));
+                int size = sizeof(nowServerAddr);
+                len = recvfrom(nowClientSocket, buffer, 1024, 0,
+                                             (sockaddr *)&nowServerAddr, &size);
+                if (len <= 0) {
+                    printf("Connection failed\n");
+                    break;
+                }
+            }
+            printf("Connected successfully\n");
+            string Address = ip + ":" + std::to_string(port);
+            serverNum++;
+            serverID[Address] = serverNum;
+            IDMap[serverNum] = Address;
+            protocolType[serverNum] = protocol;
+            clientSocket[serverNum] = nowClientSocket;
+            serverAddr[serverNum] = nowServerAddr;
+            std::thread recvThread(receiveThread, protocol == 1, nowClientSocket, serverNum, nowServerAddr);
+            recvThread.detach();
+            threads[serverNum] = std::move(recvThread);
+            break;
+        }
+        case 'd': {
+            CHECK_CONNECTED();
+            printf("Enter server ID: ");
+            std::cin >> id;
+            CHECK_ID_EXIST(id);
+
+            if (protocolType[id] == 2) {
+                RequestUdpDisconnect request(id);
+                RawData data = request.serialize();
+                sendto(clientSocket[id], (char *)data.data(), data.size(), 0,
+                             (sockaddr *)&serverAddr[id], sizeof(serverAddr[id]));
+                int size = sizeof(serverAddr[id]);
+                len = recvfrom(clientSocket[id], buffer, 1024, 0,
+                                             (sockaddr *)&serverAddr[id], &size);
+                if (len <= 0) {
+                    printf("Disconnection failed\n");
+                    break;
+                }
+                RawData dataRecv(buffer, buffer + len);
+                std::unique_ptr<Package> package = Package::deserialize(dataRecv);
+                if (package == nullptr) {
+                    printf("Received invalid data\n");
+                    break;
+                }
+                ResponsePackage *responsePackage =
+                        dynamic_cast<ResponsePackage *>(package.get());
+                std::unique_ptr<Response> response = std::move(responsePackage->response);
+                if (response->getType() != UDP_DISCONNECT) {
+                    printf("Received invalid data\n");
+                    break;
+                }
+                closesocket(clientSocket[id]);
+            } else {
+                closesocket(clientSocket[id]);
+            }
+
+            releaseResources(id);
+            break;
+        }
+        case 'n': {
+            CHECK_CONNECTED();
+            printf("Enter server ID: ");
+            std::cin >> id;
+            CHECK_ID_EXIST(id);
+            printf("Enter city code: ");
+            int cityCode;
+            std::cin >> cityCode;
+            RequestCityName request(id, cityCode);
+            sendRequest(id, request);
+            break;
+        }
+        case 'w': {
+            CHECK_CONNECTED();
+            printf("Enter server ID: ");
+            std::cin >> id;
+            CHECK_ID_EXIST(id);
+            printf("Enter city code: ");
+            int cityCode;
+            std::cin >> cityCode;
+            printf("Enter date (year month day, 2004 04 01): ");
+            int year, month, day;
+            std::cin >> year >> month >> day;
+            if (!checkDate(year, month, day)) {
+                printf("Invalid date\n");
+                break;
+            }
+            RequestWeatherInfo request(id, cityCode, year, month, day);
+            sendRequest(id, request);
+            break;
+        }
+        case 'l': {
+            CHECK_CONNECTED();
+            printf("Enter server ID: ");
+            std::cin >> id;
+            CHECK_ID_EXIST(id);
+            RequestClientList request(id);
+            sendRequest(id, request);
+            break;
+        }
+        case 'f': {
+            CHECK_CONNECTED();
+            printf("Enter server ID: ");
+            std::cin >> id;
+            CHECK_ID_EXIST(id);
+            printf("Enter target ID: ");
+            int target;
+            std::cin >> target;
+            printf("Enter message (press Enter to send): ");
+            std::cin.ignore();
+            string message;
+            std::getline(std::cin, message);
+            RequestSendMessage request(id, target, message);
+            sendRequest(id, request);
+            break;
+        }
+        case 'q': {
+            CHECK_CONNECTED();
+            for (auto &pair : serverID) {
+                int id = pair.second;
+                if (protocolType[id] == 2) {
+                    RequestUdpDisconnect request(id);
+                    RawData data = request.serialize();
+                    sendto(clientSocket[id], (char *)data.data(), data.size(), 0,
+                                 (sockaddr *)&serverAddr[id], sizeof(serverAddr[id]));
+                    int size = sizeof(serverAddr[id]);
+                    len = recvfrom(clientSocket[id], buffer, 1024, 0,
+                                                 (sockaddr *)&serverAddr[id], &size);
+                    if (len <= 0) {
+                        printf("Disconnection failed\n");
+                        break;
+                    }
+                } else {
+                    closesocket(clientSocket[id]);
+                }
+            }
+            WSACleanup();
+            printf("Quit successfully, looking forward to your next use\n");
+            return 0;
+        }
+        default:
+            printf("Invalid input, please try again\n");
+        }
+    }
+}
